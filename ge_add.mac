@@ -1,0 +1,190 @@
+; Addition of two group elements
+;
+; Author: Daan Sprenkels <hello@dsprenkels.com>
+
+%include "fe12_mul.mac"
+
+%macro ge_add 4
+    ; The next chain of procedures is an adapted version of Algorithm 4
+    ; from the Renes-Costello-Batina addition laws. [Renes2016]
+
+    ; fe12_squeeze guarantees that every processed double is always divisible
+    ; by 2^k and bounded by 1.01 * 2^21 * 2^k, with k the limb's offset
+    ; (0, 22, 43, etc.). This theorem (3.2) is proven in [Hash127] by Daniel
+    ; Bernstein, although it needs to be adapted to this instance.
+    ; Precondition of the theorem is that the input to fe12_squeeze is divisible
+    ; by 2^k and bounded by 0.98 * 2^53 * 2^k.
+
+    ; In other words: Any product limbs produced by fe12_mul (uncarried), must be
+    ; bounded by ±0.98 * 2^53. In fe12_mul, the lowest limb is multiplied by the
+    ; largest value, namely ±(11*19 + 1)*x*y = ±210*x*y for x the largest possible
+    ; 22-bit limbs. This means that the summed limb bits of the 2 multiplied
+    ; operands cannot exceed ±0.98 * 2^53 / 210. Rounded down this computes to
+    ; ~±2^45.2 > ±1.1*2^45. So if we restrict ourselves to a multiplied upper bound
+    ; of ±1.1*2^45, we should be all right.
+
+    ; We would manage this by multiplying 2^21 values with 2^24 values
+    ; (because 21 + 24 ≤ 45), but for example 2^23 * 2^23 is *forbidden* as it
+    ; may overflow (23 + 23 > 45).
+    ;
+    ; TODO(dsprenkels) Check everywhere around fe12_mul whether its loads/stores
+    ; are actually necessary.
+    %push ge_add_ctx
+    %xdefine x3          %1
+    %xdefine y3          %1 + 12*8
+    %xdefine z3          %1 + 24*8
+    %xdefine x1          %2
+    %xdefine y1          %2 + 12*8
+    %xdefine z1          %2 + 24*8
+    %xdefine x2          %3
+    %xdefine y2          %3 + 12*8
+    %xdefine z2          %3 + 24*8
+    %xdefine t0          %4
+    %xdefine t1          %4 + 1*384
+    %xdefine t2          %4 + 2*384
+    %xdefine t3          %4 + 3*384
+    %xdefine t4          %4 + 4*384
+    %xdefine t5          %4 + 5*384
+    %xdefine scratch     %4 + 6*384
+
+    ; assume forall v in {x, y, z} : |v| ≤ 1.01 * 2^22
+    %assign i 0
+    %rep 12
+        vbroadcastsd ymm0, qword [x1 + i*8]         ; [x1, x1, x1, x1]
+        vbroadcastsd ymm1, qword [y1 + i*8]         ; [y1, y1, y1, y1]
+        vbroadcastsd ymm2, qword [z1 + i*8]         ; [z1, z1, z1, z1]
+        vbroadcastsd ymm3, qword [x2 + i*8]         ; [x2, x2, x2, x2]
+        vbroadcastsd ymm4, qword [y2 + i*8]         ; [y2, y2, y2, y2]
+        vbroadcastsd ymm5, qword [z2 + i*8]         ; [z2, z2, z2, z2]
+
+        vblendpd ymm6, ymm0, ymm1, 0b1000           ; [x1, x1, x1, y1]
+        vblendpd ymm7, ymm1, ymm2, 0b1001           ; [z1, y1, y1, z1]
+        vaddpd ymm6, ymm6, ymm7                     ; computing [v14, v4, v4, v9] ≤ 1.01 * 2^22
+        vmovapd yword [t3 + 32*i], ymm6             ; t3 = [??, ??, v4, v9]
+        vblendpd ymm8, ymm3, ymm4, 0b1000           ; [x2, x2, x2, y2]
+        vblendpd ymm9, ymm4, ymm5, 0b1001           ; [z2, y2, y2, z2]
+        vaddpd ymm8, ymm8, ymm9                     ; computing [v15, v5, v5, v10] ≤ 1.01 * 2^22
+        vmovapd yword [t4 + 32*i], ymm8             ; t4 = [??, ??, v5, v10]
+
+        vblendpd ymm7, ymm7, ymm0, 0b0010           ; [z1, x1, y1, z1]
+        vblendpd ymm7, ymm7, ymm6, 0b0001           ; [v14, x1, y1, z1]
+        vmovapd yword [t0 + 32*i], ymm7             ; t0 = [v14, x1, y1, z1]
+        vblendpd ymm9, ymm9, ymm3, 0b0010           ; [z2, x2, y2, z2]
+        vblendpd ymm9, ymm9, ymm8, 0b0001           ; [v15, x2, y2, z2]
+        vmovapd yword [t1 + 32*i], ymm9             ; t1 = [v15, x2, y2, z2]
+
+        %assign i (i + 1) % 12
+    %endrep
+
+    fe12x4_mul t2, t0, t1, scratch                  ; computing [v16, v1, v2, v3] ≤ 1.01 * 2^21
+
+    vmovsd xmm15, qword [rel .const_13318]          ; [b]
+    vmovapd ymm14, yword [rel .const_3_3_3_3]       ; [3, 3, 3, 3]
+    vxorpd ymm9, ymm9, ymm9                         ; [0, 0, 0, 0]
+
+    %assign i 6
+    %rep 12
+        ; We will need more registers here than we have available in ymm12-ymm15,
+        ; so we will need to spill *some*, but not all, registers to the stack.
+        %push ge_add_ctx_1
+
+        %if i >= 8
+            %xdefine v16v1v2v3 8
+            vmovapd ymm%[v16v1v2v3], yword [t2 + 32*i]  ; [v16, v1, v2, v3]
+        %else
+            %xdefine v16v1v2v3 i
+        %endif
+
+        vextractf128 xmm13, ymm%[v16v1v2v3], 0b1        ; [v2, v3]
+        vunpckhpd xmm12, xmm%[v16v1v2v3], xmm13         ; [v1, v3]
+        vmovddup xmm13, xmm13                           ; [v2, v2]
+        vaddpd xmm13, xmm13, xmm12                      ; computing [v7, v12] ≤ 1.01 * 2^22
+        vinsertf128 ymm10, ymm9, xmm13, 0b1             ; [0, 0, v7, v12]
+        vmovapd yword [t1 + 32*i], ymm10                ; t1 = [0, 0, v7, v12]
+
+        vpermilpd xmm11, xmm12, 0b01                    ; [v3, v1]
+        vaddsd xmm10, xmm12, xmm11                      ; computing v17 ≤ 1.01 * 2^22
+        vsubsd xmm10, xmm%[v16v1v2v3], xmm10            ; computing v18 ≤ 1.52 * 2^22
+        vmulsd xmm8, xmm11, xmm15                       ; computing v19 ≤ 1.65 * 2^34
+        vsubsd xmm8, xmm10, xmm8                        ; computing v20 ≤ 1.66 * 2^34
+        vmulsd xmm10, xmm10, xmm15                      ; computing v25 ≤ 1.24 * 2^36
+        vmulsd xmm13, xmm11, xmm14                      ; computing v27 ≤ 1.52 * 2^22
+        vsubsd xmm10, xmm10, xmm13                      ; computing v28 ≤ 1.25 * 2^36
+        vblendpd xmm11, xmm11, xmm10, 0b01              ; [v28, v1]
+        vsubpd xmm12, xmm11, xmm12                      ; computing [v29 ≤ 1.26 * 2^36, v34 ≤ 1.01 * 2^22]
+        vinsertf128 ymm12, ymm8, xmm12, 0b1             ; [v20, ??, v29, v34]
+        vmulpd ymm%[v16v1v2v3], ymm12, ymm14            ; computing [v22, ??, v31, v33]
+
+        %if i >= 8
+            vmovapd yword [t5 + 32*i], ymm%[v16v1v2v3]
+        %endif
+
+        %pop ge_add_ctx_1
+        %assign i (i + 1) % 12
+    %endrep
+
+    %assign i 8
+    %rep 4
+        vmovapd ymm%[i], yword [t5 + 32*i]              ; reload {ymm8-ymm11}
+        %assign i (i + 1) % 12
+    %endrep
+
+    fe12x4_squeeze_body
+
+    %assign i 6
+    %rep 12
+        vmovapd xmm13, oword [t2 + 32*i + 16]           ; [v2, v3]
+        vextractf128 xmm15, ymm%[i], 0b1                ; [v31, v33]
+        vpermilpd xmm14, xmm15, 0b01                    ; [v33, v31]
+        vsubsd xmm12, xmm13, xmm%[i]                    ; computing v23 ≤ 1.01 * 2^22
+        vaddsd xmm13, xmm13, xmm%[i]                    ; computing v24 ≤ 1.01 * 2^22
+        vblendpd xmm12, xmm15, xmm12, 0b01              ; [v23, v33]
+        vblendpd xmm13, xmm14, xmm13, 0b01              ; [v24, v31]
+        vmovapd oword [t3 + 32*i], xmm12                ; t3 = [v23, v33, v4, v9]
+        vmovapd oword [t4 + 32*i], xmm13                ; t4 = [v24, v31, v5, v10]
+        vblendpd xmm14, xmm12, xmm13, 0b01              ; [v24, v33]
+        vblendpd xmm15, xmm12, xmm13, 0b10              ; [v23, v31]
+        vmovapd oword [t0 + 32*i +  0], xmm14           ; t0 = [v24, v33, ??, ??]
+        vmovapd oword [t0 + 32*i + 16], xmm15           ; t0 = [v24, v33, v23, v31]
+
+        %assign i (i + 1) % 12
+    %endrep
+
+    fe12x4_mul t2, t3, t4, scratch                      ; computing [v37, v36, v6, v11] ≤ 1.01 * 2^21
+
+    %assign i 6
+    %rep 12
+        vsubpd ymm%[i], ymm%[i], yword [t1 + 32*i]      ; computing [v37, v36, v8, v13] ≤ 1.01 * 2^22
+        vpermilpd xmm15, xmm%[i], 0b01                  ; [v36, v37]
+        vaddsd xmm15, xmm%[i], xmm15                    ; computing v38 ≤ 1.01 * 2^22
+        vmovsd qword [y3 + i*8], xmm15                  ; store y3
+        vperm2f128 ymm15, ymm%[i], ymm%[i], 0b00010001  ; [v8, v13, v8, v13]
+        vpermilpd ymm15, ymm15, 0b1100                  ; [v8, v8, v13, v13]
+        vmovapd yword [t1 + 32*i], ymm15                ; t1 = [v8, v8, v13, v13]
+
+        %assign i (i + 1) % 12
+    %endrep
+
+    fe12x4_mul t2, t0, t1, scratch                      ; computing [v39, v42, v41, v35] ≤ 1.01 * 2^21
+
+    %assign i 6
+    %rep 12
+        vextractf128 xmm15, ymm%[i], 0b1                ; [v41, v35]
+        vpermilpd xmm14, xmm%[i], 0b01                  ; [v42, v39]
+        vaddsd xmm14, xmm15, xmm14                      ; computing v43 ≤ 1.01 * 2^22
+        vmovsd qword [z3 + i*8], xmm14                  ; store z3
+        vpermilpd xmm13, xmm15, 0b01                    ; [v35, v41]
+        vsubsd xmm13, xmm%[i], xmm13                    ; computing v40 ≤ 1.01 * 2^22
+        vmovsd qword [x3 + i*8], xmm13                  ; store x3
+
+        %assign i (i + 1) % 12
+    %endrep
+    %pop ge_add_ctx
+%endmacro
+
+%macro ge_add_consts 0
+    align 32, db 0
+    .const_3_3_3_3: times 4 dq 3.0
+    align 8, db 0
+    .const_13318:   dq 13318.0
+%endmacro

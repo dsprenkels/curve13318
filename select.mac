@@ -1,0 +1,75 @@
+; Select an element from a lookup table
+;
+; Author: Daan Sprenkels <hello@dsprenkels.com>
+
+%macro select 2
+    ; Select the element from the lookup table at index `idx` and put the
+    ; element in ymm0-ymm8.
+    ; C-type: void select(ge dest, uint8_t idx, const ge ptable[16])
+    ;
+    ; Arguments:
+    ;   - %1: general purpose register containing idx (unsigned) *may not be al*!
+    ;   - %2: pointer to the start of the lookup table
+    ;
+    ;
+    ; Anatomy of this routine:
+    ; For each scan of the lookup table we will need to do one load and one
+    ; vandpd instruction. For borh of these ops, the reciprocal throughput
+    ; is 1.0. We will actually need to do *some* more loads, so we will
+    ; focus on minimising those.
+    ;
+    ; We use the following registers as accumulators:
+    ;   - {ymm0-ymm2}: X
+    ;   - {ymm3-ymm5}: Y
+    ;   - {ymm6-ymm8}: Z
+
+    ; conditionally move the first element from ptable (or set to 0)
+    xor rax, rax
+    test %1, %1
+    setz al
+    neg rax
+    vmovq xmm15, rax
+    vmovddup xmm15, xmm15
+    vinsertf128 ymm15, xmm15, 0b1
+    %assign j 0
+    %rep 9
+        vandpd ymm%[j], ymm15, yword [%2 + 32*j]
+        %assign j j+1
+    %endrep
+
+    ; conditionally move the other elements from ptable
+    %assign i 1
+    %rep 15
+        xor rax, rax
+        cmp %1, i
+        sete al
+        neg rax
+        vmovq xmm15, rax
+        vmovddup xmm15, xmm15
+        vinsertf128 ymm15, xmm15, 0b1
+
+        %assign j 0
+        %rep 9
+            vandpd ymm14, ymm15, yword [%2 + 288*i + 32*j]
+            vaddpd ymm%[j], ymm%[j], ymm14
+            %assign j j+1
+        %endrep
+
+        %assign i i+1
+    %endrep
+
+    ; conditionally move the neutral element if idx == 31
+    xor rax, rax
+    cmp %1, 31
+    sete al
+    neg rax
+    and rax, qword [rel .const_1]
+    vxorpd ymm15, ymm15, ymm15
+    vmovq xmm15, rax
+    vorpd ymm3, ymm3, ymm15
+%endmacro
+
+%macro select_consts 0
+    align 8,  db 0
+    .const_1: dq 1.0
+%endmacro

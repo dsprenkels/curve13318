@@ -1,0 +1,136 @@
+%ifndef FE12_SQUEEZE_MAC_
+%define FE12_SQUEEZE_MAC_
+
+; Carry ripple macros for integers modulo 2^255 - 19
+;
+; Author: Daan Sprenkels <hello@dsprenkels.com>
+
+%macro fe12x4_squeeze_load 1
+    ; load field element
+    vmovapd ymm0, yword [%1]
+    vmovapd ymm1, yword [%1+32]
+    vmovapd ymm2, yword [%1+64]
+    vmovapd ymm3, yword [%1+96]
+    vmovapd ymm4, yword [%1+128]
+    vmovapd ymm5, yword [%1+160]
+    vmovapd ymm6, yword [%1+192]
+    vmovapd ymm7, yword [%1+224]
+    vmovapd ymm8, yword [%1+256]
+    vmovapd ymm9, yword [%1+288]
+    vmovapd ymm10, yword [%1+320]
+    vmovapd ymm11, yword [%1+352]
+%endmacro
+
+%macro .carrystep 3
+; Arguments:
+;   %1: carry to this register
+;   %2: carry from this register
+;   %3: this label contains the precisionloss value
+vmovapd ymm14, yword [rel %3]
+vaddpd ymm15, %2, ymm14
+vsubpd ymm15, ymm15, ymm14
+vaddpd %1, %1, ymm15
+vsubpd %2, %2, ymm15
+%endmacro
+
+%macro fe12x4_squeeze_body 0
+    ; Interleave three carry chains (6 rounds):
+    ;
+    ;   - a: z[0] -> z[1] ->  z[2] ->  z[3] -> z[4] -> z[5]
+    ;   - b: z[4] -> z[5] ->  z[6] ->  z[7] -> z[8] -> z[9]
+    ;   - c: z[8] -> z[9] -> z[10] -> z[11] -> z[0] -> z[1]
+    ;
+    ; Input:  one vectorized field element (ymm0..ymm11)
+    ; Output: one vectorized field element (ymm0..ymm11)
+    ;
+    ; Precondition:
+    ;   - For all limbs x in z : |x| <= 0.99 * 2^53
+    ;
+    ; Postcondition:
+    ;   - All significands fit in b + 1 bits (b = 22, 21, 21, etc.)
+    ;
+    ; Registers:
+    ;   - ymm0..ymm11:  four input and output field elments
+    ;   - ymm14,ymm14:  large values to force precision loss
+    ;   - ymm14,ymm15:  two temporary registers for t0 and t1
+
+    ; round 1
+    .carrystep ymm1, ymm0, .precisionloss0
+    .carrystep ymm5, ymm4, .precisionloss4
+    .carrystep ymm9, ymm8, .precisionloss8
+
+    ; round 2
+    .carrystep ymm2, ymm1, .precisionloss1
+    .carrystep ymm6, ymm5, .precisionloss5
+    .carrystep ymm10, ymm9, .precisionloss9
+
+    ; round 3
+    .carrystep ymm3, ymm2, .precisionloss2
+    .carrystep ymm7, ymm6, .precisionloss6
+    .carrystep ymm11, ymm10, .precisionloss10
+
+    ; round 4
+    .carrystep ymm4, ymm3, .precisionloss3
+    .carrystep ymm8, ymm7, .precisionloss7
+    vmovapd ymm14, yword [rel .precisionloss11]
+    vaddpd ymm15, ymm11, ymm14
+    vsubpd ymm15, ymm15, ymm14
+    vmovapd ymm14, yword [rel .reduceconstant]
+    vmulpd ymm14, ymm15, ymm14
+    vaddpd ymm0, ymm0, ymm14
+    vsubpd ymm11, ymm11, ymm15
+
+    ; round 5
+    .carrystep ymm5, ymm4, .precisionloss4
+    .carrystep ymm9, ymm8, .precisionloss8
+    .carrystep ymm1, ymm0, .precisionloss0
+%endmacro
+
+%macro fe12x4_squeeze_store 1
+    ; store field element
+    vmovapd yword [%1], ymm0
+    vmovapd yword [%1+32], ymm1
+    vmovapd yword [%1+64], ymm2
+    vmovapd yword [%1+96], ymm3
+    vmovapd yword [%1+128], ymm4
+    vmovapd yword [%1+160], ymm5
+    vmovapd yword [%1+192], ymm6
+    vmovapd yword [%1+224], ymm7
+    vmovapd yword [%1+256], ymm8
+    vmovapd yword [%1+288], ymm9
+    vmovapd yword [%1+320], ymm10
+    vmovapd yword [%1+352], ymm11
+%endmacro
+
+%macro fe12x4_squeeze 1
+    fe12x4_squeeze_load %1
+    fe12x4_squeeze_body
+    fe12x4_squeeze_store %1
+%endmacro
+
+%macro fe12x4_squeeze_noload 1
+    fe12x4_squeeze_body
+    fe12x4_squeeze_store %1
+%endmacro
+
+%macro fe12x4_squeeze_consts 0
+    ; Define the constants needed for the other macros in this file
+
+    align 32, db 0
+    .precisionloss0:    times 4 dq 0x3p73
+    .precisionloss1:    times 4 dq 0x3p94
+    .precisionloss2:    times 4 dq 0x3p115
+    .precisionloss3:    times 4 dq 0x3p136
+    .precisionloss4:    times 4 dq 0x3p158
+    .precisionloss5:    times 4 dq 0x3p179
+    .precisionloss6:    times 4 dq 0x3p200
+    .precisionloss7:    times 4 dq 0x3p221
+    .precisionloss8:    times 4 dq 0x3p243
+    .precisionloss9:    times 4 dq 0x3p264
+    .precisionloss10:   times 4 dq 0x3p285
+    .precisionloss11:   times 4 dq 0x3p306
+    .reduceconstant:    times 4 dq 0x13p-255
+
+%endmacro
+
+%endif
