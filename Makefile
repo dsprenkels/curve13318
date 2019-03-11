@@ -55,3 +55,17 @@ clean:
 
 include $(ASM_SCRS:%.asm=%.d)
 include $(C_SRCS:%.c=%.d)
+
+
+# ===== Rules for benchmarking setup below this line =====
+
+bench.out: bench.o $(ASM_OBJS) $(C_OBJS) $(S_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+.PHONY: bench
+bench: bench.out
+	@echo "[!] Dont forget to"
+	@echo "    - Disable TurboBoost;"
+	@echo "    - Disable HyperThreading cores; and"
+	@echo "    - Set the CPU to 'performance'."
+	./bench.out | sort | head -n 500 | tail -n 1
